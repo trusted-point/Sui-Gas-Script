@@ -11,8 +11,9 @@ load_dotenv()
 
 CMC_API_KEY = os.getenv("CMC_API_KEY")
 SUI_PATH = os.getenv("SUI_PATH")
+GAS_BUDGET = os.getenv("GAS_BUDGET")
 
-if not CMC_API_KEY or not SUI_PATH:
+if not CMC_API_KEY or not SUI_PATH or not GAS_BUDGET:
     print("Error: Required environment variables are missing.")
     print("Please ensure CMC_API_KEY and SUI_PATH are set in the .env file")
     sys.exit(1)
@@ -20,7 +21,7 @@ if not CMC_API_KEY or not SUI_PATH:
 CMC_API_URL = f"https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?CMC_PRO_API_KEY={CMC_API_KEY}&symbol=SUI"
 SUI_RPC_URL = os.getenv("SUI_RPC_URL", "https://fullnode.mainnet.sui.io/")
 
-latest_sui_price = None
+LATEST_SUI_PRICE = None
 
 def read_reference_values():
     """Reads the reference values from reference.json."""
@@ -37,8 +38,8 @@ def get_current_sui_price():
         if data["status"]["error_code"] != 0:
             raise Exception(f"API Error: {data['status']['error_message']}")
         price = data["data"]["SUI"]["quote"]["USD"]["price"]
-        global latest_sui_price
-        latest_sui_price = price
+        global LATEST_SUI_PRICE
+        LATEST_SUI_PRICE = price
         return round(price, 4)
     except Exception as e:
         print("Error fetching SUI price:", e)
@@ -53,7 +54,7 @@ def calculate_new_mist(current_price, reference_price, reference_mist):
 def update_validator_gas_price(mist_value):
     """Executes the command to update the validator gas price."""
     try:
-        command = f"{SUI_PATH}/sui validator update-gas-price {mist_value}"
+        command = f"{SUI_PATH} validator update-gas-price {mist_value} --gas-budget {GAS_BUDGET}"
         print("Executing command:", command)
         result = subprocess.run(command, shell=True, capture_output=True, text=True)
         if result.stderr:
@@ -119,8 +120,7 @@ def process_updates():
                 reference_data = read_reference_values()
                 current_price = get_current_sui_price()
                 if not current_price:
-                    global latest_sui_price
-                    current_price = latest_sui_price
+                    current_price = LATEST_SUI_PRICE
                 new_mist = calculate_new_mist(current_price, reference_data["sui_price"], reference_data["mist"])
 
                 price_change_percent = ((current_price - reference_data["sui_price"]) / reference_data["sui_price"] * 100)
@@ -134,7 +134,7 @@ def process_updates():
                 print("=========================\n")
 
                 print("Updating validator gas price...")
-                updated = True
+                updated = update_validator_gas_price(new_mist)
                 if updated:
                     print("Successfully updated validator gas price")
                 else:
