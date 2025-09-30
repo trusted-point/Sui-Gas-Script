@@ -1,91 +1,75 @@
 import os
 import sys
-import json
 import time
 import subprocess
 import requests
-import schedule
 from dotenv import load_dotenv
 
+from utils.args import args
+from utils.logger import logger
+
+# Load environment variables
 load_dotenv()
 
+# CoinMarketCap API key
 CMC_API_KEY = os.getenv("CMC_API_KEY")
-SUI_PATH = os.getenv("SUI_PATH")
-GAS_BUDGET = os.getenv("GAS_BUDGET")
-
-if not CMC_API_KEY or not SUI_PATH or not GAS_BUDGET:
-    print("Error: Required environment variables are missing.")
-    print("Please ensure CMC_API_KEY and SUI_PATH are set in the .env file")
+if not CMC_API_KEY:
+    logger.error("CMC_API_KEY is not set in the .env file")
     sys.exit(1)
 
-CMC_API_URL = f"https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest?CMC_PRO_API_KEY={CMC_API_KEY}&symbol=SUI"
-SUI_RPC_URL = os.getenv("SUI_RPC_URL", "https://fullnode.mainnet.sui.io/")
-
-LATEST_SUI_PRICE = None
-
-def read_reference_values():
-    """Reads the reference values from reference.json."""
-    file_path = os.path.join(os.path.dirname(__file__), 'reference.json')
-    with open(file_path, 'r') as f:
-        data = json.load(f)
-    return data
+# Global configuration
+CMC_API_URL = (
+    f"https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest"
+    f"?CMC_PRO_API_KEY={CMC_API_KEY}&symbol=SUI"
+)
+SUI_RPC_URL = args.sui_rpc
+SUI_BIN_PATH = args.sui_bin_path
+SUI_GAS_BUDGET = args.sui_gas_budget
+SUI_REF_TOKEN_PRICE = args.sui_ref_token_price
+SUI_REF_GAS_PRICE = args.sui_ref_gas_price
+LAST_UPDATED_EPOCH = None
 
 def get_current_sui_price():
-    """Fetches the current SUI price from CoinMarketCap."""
+    """Fetch the current SUI price from CoinMarketCap."""
     try:
-        response = requests.get(CMC_API_URL)
+        response = requests.get(CMC_API_URL, timeout=10)
+        response.raise_for_status()
+
         data = response.json()
-        if data["status"]["error_code"] != 0:
-            raise Exception(f"API Error: {data['status']['error_message']}")
+        if data.get("status", {}).get("error_code") != 0:
+            raise ValueError(f"CMC API Error: {data['status']['error_message']}")
+
         price = data["data"]["SUI"]["quote"]["USD"]["price"]
-        global LATEST_SUI_PRICE
-        LATEST_SUI_PRICE = price
+
         return round(price, 4)
+
     except Exception as e:
-        print("Error fetching SUI price:", e)
+        logger.error(f"Failed to fetch SUI price: {e}")
         raise
 
-def calculate_new_mist(current_price, reference_price, reference_mist):
-    """Calculates the new mist value based on the price change."""
-    price_ratio = reference_price / current_price
-    calculated_mist = round(reference_mist * price_ratio)
-    return min(calculated_mist, 1000)
-
-def update_validator_gas_price(mist_value):
-    """Executes the command to update the validator gas price."""
-    try:
-        command = f"{SUI_PATH} validator update-gas-price {mist_value} --gas-budget {GAS_BUDGET}"
-        print("Executing command:", command)
-        result = subprocess.run(command, shell=True, capture_output=True, text=True)
-        if result.stderr:
-            print("Command stderr:", result.stderr)
-        print("Command output:", result.stdout)
-        return True
-    except Exception as e:
-        print("Error updating validator gas price:", e)
-        return False
-
 def get_epoch_info():
-    """Gets the latest epoch information from the SUI RPC endpoint."""
+    """Get the latest epoch information from the SUI RPC endpoint."""
     try:
         payload = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "suix_getLatestSuiSystemState",
-            "params": []
+            "params": [],
         }
         headers = {"Content-Type": "application/json"}
-        response = requests.post(SUI_RPC_URL, json=payload, headers=headers)
-        if not response.ok:
-            raise Exception(f"HTTP error! status: {response.status_code}")
+
+        response = requests.post(SUI_RPC_URL, json=payload, headers=headers, timeout=10)
+        response.raise_for_status()
+
         data = response.json()
         if "result" not in data:
-            raise Exception("No system state data received")
-        
+            raise ValueError("No system state data received from RPC")
+
         system_state = data["result"]
         current_epoch = int(system_state["epoch"])
         epoch_start_timestamp_ms = int(system_state["epochStartTimestampMs"])
         epoch_duration_ms = int(system_state["epochDurationMs"])
+
         now = int(time.time() * 1000)
         epoch_end_timestamp = epoch_start_timestamp_ms + epoch_duration_ms
         remaining_ms = epoch_end_timestamp - now
@@ -95,71 +79,124 @@ def get_epoch_info():
             "remaining_ms": remaining_ms,
             "epoch_end_timestamp": epoch_end_timestamp,
             "epoch_start_timestamp_ms": epoch_start_timestamp_ms,
-            "epoch_duration_ms": epoch_duration_ms
+            "epoch_duration_ms": epoch_duration_ms,
         }
+
     except Exception as e:
-        print("Error fetching epoch information:", e)
+        logger.error(f"Failed to fetch epoch information: {e}")
         raise
 
+def calculate_new_mist(current_price, reference_price, reference_mist):
+    """Calculate the new mist value based on the price change."""
+    price_ratio = reference_price / current_price
+    calculated_mist = round(reference_mist * price_ratio)
+    return min(calculated_mist, 1000)
+
+def update_validator_gas_price(mist_value):
+    """Execute the command to update the validator gas price."""
+    try:
+        command = (
+            f"{SUI_BIN_PATH} validator update-gas-price {mist_value} "
+            f"--gas-budget {SUI_GAS_BUDGET}"
+        )
+        logger.info(f"Executing: {command}")
+
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True
+        )
+
+        if result.stderr:
+            logger.warning(f"Command stderr: {result.stderr.strip()}")
+        if result.stdout:
+            logger.debug(f"Command output: {result.stdout.strip()}")
+
+        return result.returncode == 0
+
+    except Exception as e:
+        logger.error(f"Failed to update validator gas price: {e}")
+        return False
+
 def process_updates():
-    """Processes updates by checking epoch information and updating gas price if needed."""
+    """Check epoch information and update gas price if needed."""
+    global LAST_UPDATED_EPOCH
+
     try:
         epoch_info = get_epoch_info()
         remaining_ms = epoch_info["remaining_ms"]
+        current_epoch = epoch_info["current_epoch"]
+
+        # Format remaining time
         remaining_hours = remaining_ms // (1000 * 60 * 60)
         remaining_minutes = (remaining_ms % (1000 * 60 * 60)) // (1000 * 60)
         remaining_seconds = (remaining_ms % (1000 * 60)) // 1000
 
-        print("\n=== Sui Epoch Information ===")
-        print("Current Epoch:", epoch_info["current_epoch"])
-        print(f"Time Remaining: {remaining_hours} hours, {remaining_minutes} minutes, {remaining_seconds} seconds")
-        print("=========================\n")
+        logger.info(
+            f"Epoch {current_epoch} | "
+            f"Time remaining: {remaining_hours}h {remaining_minutes}m {remaining_seconds}s"
+        )
 
+        # Skip if already updated this epoch
+        if LAST_UPDATED_EPOCH == current_epoch:
+            logger.info(f"Gas price already updated for epoch {current_epoch}, skipping.")
+            return
+
+        # Update gas price if less than 1 hour remains
         if remaining_ms < 60 * 60 * 1000:
-            try:
-                reference_data = read_reference_values()
-                current_price = get_current_sui_price()
-                if not current_price:
-                    current_price = LATEST_SUI_PRICE
-                new_mist = calculate_new_mist(current_price, reference_data["sui_price"], reference_data["mist"])
+            current_price = get_current_sui_price()
 
-                price_change_percent = ((current_price - reference_data["sui_price"]) / reference_data["sui_price"] * 100)
-                mist_change_percent = ((new_mist - reference_data["mist"]) / reference_data["mist"] * 100)
-                
-                print("=== Price Update ===")
-                print(f"Current SUI Price: ${current_price} ({price_change_percent:.2f}% change)")
-                print(f"Reference Price: ${reference_data['sui_price']}")
-                print(f"New Mist Value: {new_mist} ({mist_change_percent:.2f}% change)")
-                print(f"Reference Mist: {reference_data['mist']}")
-                print("=========================\n")
+            logger.info(f"Fetched current $SUI price: ${current_price}")
 
-                print("Updating validator gas price...")
-                updated = update_validator_gas_price(new_mist)
-                if updated:
-                    print("Successfully updated validator gas price")
-                else:
-                    print("Failed to update validator gas price")
-            except Exception as price_error:
-                print("Error processing price update:", price_error)
+            new_mist = calculate_new_mist(
+                current_price, SUI_REF_TOKEN_PRICE, SUI_REF_GAS_PRICE
+            )
+
+            price_change_percent = (
+                (current_price - SUI_REF_TOKEN_PRICE) / SUI_REF_TOKEN_PRICE * 100
+            )
+            mist_change_percent = (
+                (new_mist - SUI_REF_GAS_PRICE) / SUI_REF_GAS_PRICE * 100
+            )
+
+            logger.info(
+                f"SUI Price: ${current_price} ({price_change_percent:.2f}% vs ref ${SUI_REF_TOKEN_PRICE})"
+            )
+            logger.info(
+                f"Mist Value: {new_mist} ({mist_change_percent:.2f}% vs ref {SUI_REF_GAS_PRICE})"
+            )
+            
+            pass
+
+            if update_validator_gas_price(new_mist):
+                logger.info(f"Validator gas price updated successfully for epoch {current_epoch}")
+                LAST_UPDATED_EPOCH = current_epoch
+            else:
+                logger.error(f"Validator gas price update failed for epoch {current_epoch}")
+
     except Exception as e:
-        print("Error in process updates:", e)
+        logger.error(f"Process update failed: {e}")
 
 def main():
-    """Starts the SUI monitoring script."""
-    print("Starting SUI monitoring (checking every hour)...")
-    print("Reference values:", read_reference_values())
-    print("----------------------------------------\n")
-
-    schedule.every().hours.at(":00").do(process_updates)
-
-    process_updates()
+    """Start the SUI monitoring script loop."""
+    logger.info("==============================================================")
+    logger.info("Starting SUI Gas Price Monitor")
+    logger.info(
+        f"Reference values: SUI price=${SUI_REF_TOKEN_PRICE}, "
+        f"GAS price={SUI_REF_GAS_PRICE} $MIST"
+    )
 
     try:
         while True:
-            schedule.run_pending()
-            time.sleep(1)
+            try:
+                process_updates()
+            except Exception as e:
+                logger.error(f"Unexpected error in main loop: {e}")
+
+            logger.info("Sleeping for 10 minutes before next check...")
+            time.sleep(10 * 60)
+            logger.info("==============================================================")
+
     except KeyboardInterrupt:
-        print("\nScript stopped by user")
+        logger.info("Keyboard interrupt received. Exiting gracefully...")
         sys.exit(0)
 
 if __name__ == "__main__":
